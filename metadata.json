@@ -1,0 +1,6 @@
+{
+  "name": "Gemini Chat Studio",
+  "description": "A modern, high-performance AI chatbot interface built with Google Gemini, featuring smart conversational threads, markdown rendering, code highlighting, prompt suggestions, and real-time responses.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
