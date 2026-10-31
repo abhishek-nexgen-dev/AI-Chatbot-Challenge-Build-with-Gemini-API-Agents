@@ -9,7 +9,6 @@ import { MessageItem } from './components/MessageItem';
 import { ChatInput } from './components/ChatInput';
 import { SettingsModal } from './components/SettingsModal';
 import { ImagePreviewModal } from './components/ImagePreviewModal';
-import { getSmartAssistantResponse } from './utils/aiResponses';
 
 const DEFAULT_SETTINGS: AppSettings = {
   theme: 'dark',
@@ -258,68 +257,182 @@ export default function App() {
     );
   };
 
-  const streamSimulatedResponse = async (responseText: string, conversationId: string) => {
-    isStreamingRef.current = true;
-    const words = responseText.split(' ');
-    let currentText = '';
-
-    for (let i = 0; i < words.length; i++) {
-      if (!isStreamingRef.current) break;
-
-      currentText += (i === 0 ? '' : ' ') + words[i];
-
-      setConversations((prev) =>
-        prev.map((c) => {
-          if (c.id !== conversationId) return c;
-          const msgs = [...c.messages];
-          const last = msgs[msgs.length - 1];
-          if (last && last.role === 'model') {
-            msgs[msgs.length - 1] = {
-              ...last,
-              content: currentText,
-              status: 'streaming',
-            };
-          }
-          return { ...c, messages: msgs, updatedAt: Date.now() };
-        })
-      );
-
-      await new Promise((r) => setTimeout(r, 16));
-    }
-
-    if (isStreamingRef.current) {
-      setConversations((prev) =>
-        prev.map((c) => {
-          if (c.id !== conversationId) return c;
-          const msgs = [...c.messages];
-          const last = msgs[msgs.length - 1];
-          if (last && last.role === 'model') {
-            msgs[msgs.length - 1] = {
-              ...last,
-              content: responseText,
-              status: 'complete',
-            };
-          }
-          return { ...c, messages: msgs, updatedAt: Date.now() };
-        })
-      );
-    }
-
-    isStreamingRef.current = false;
-    setTimeout(() => scrollToBottom(), 50);
-  };
-
   const generateAssistantResponse = async (
     targetMessages: Message[],
     conversationId: string
   ) => {
     isStreamingRef.current = true;
-    const lastUser = [...targetMessages].reverse().find((m) => m.role === 'user');
-    const promptText = lastUser?.content || '';
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
 
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    const responseText = getSmartAssistantResponse(promptText);
-    await streamSimulatedResponse(responseText, conversationId);
+    const conv = conversations.find((c) => c.id === conversationId);
+    const activeModel = conv?.model || settings.activeModel;
+    const systemInstruction = conv?.systemInstruction || settings.systemInstruction;
+
+    const payloadMessages = targetMessages
+      .filter((m) => m.content?.trim() || (m.attachments && m.attachments.length > 0))
+      .map((m) => ({
+        role: m.role,
+        content: m.content,
+        attachments: m.attachments,
+      }));
+
+    try {
+      if (settings.streamResponses) {
+        const response = await fetch('/api/chat/stream', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            messages: payloadMessages,
+            model: activeModel,
+            systemInstruction,
+            temperature: settings.temperature,
+          }),
+          signal: controller.signal,
+        });
+
+        if (!response.ok) {
+          const errData = await response.json().catch(() => ({}));
+          throw new Error(errData.error || `Server responded with status ${response.status}`);
+        }
+
+        const reader = response.body?.getReader();
+        if (!reader) {
+          throw new Error('Unable to read streaming response from server.');
+        }
+
+        const decoder = new TextDecoder();
+        let accumulatedText = '';
+        let buffer = '';
+
+        while (isStreamingRef.current) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith('data:')) continue;
+            const dataStr = trimmed.slice(5).trim();
+            if (dataStr === '[DONE]') continue;
+
+            try {
+              const parsed = JSON.parse(dataStr);
+              if (parsed.error) {
+                throw new Error(parsed.error);
+              }
+              if (parsed.text) {
+                accumulatedText += parsed.text;
+
+                setConversations((prev) =>
+                  prev.map((c) => {
+                    if (c.id !== conversationId) return c;
+                    const msgs = [...c.messages];
+                    const last = msgs[msgs.length - 1];
+                    if (last && last.role === 'model') {
+                      msgs[msgs.length - 1] = {
+                        ...last,
+                        content: accumulatedText,
+                        status: 'streaming',
+                      };
+                    }
+                    return { ...c, messages: msgs, updatedAt: Date.now() };
+                  })
+                );
+              }
+            } catch (jsonErr: any) {
+              if (jsonErr.message && !jsonErr.message.includes('JSON')) {
+                throw jsonErr;
+              }
+            }
+          }
+        }
+
+        if (isStreamingRef.current) {
+          setConversations((prev) =>
+            prev.map((c) => {
+              if (c.id !== conversationId) return c;
+              const msgs = [...c.messages];
+              const last = msgs[msgs.length - 1];
+              if (last && last.role === 'model') {
+                msgs[msgs.length - 1] = {
+                  ...last,
+                  content: accumulatedText || last.content,
+                  status: 'complete',
+                };
+              }
+              return { ...c, messages: msgs, updatedAt: Date.now() };
+            })
+          );
+        }
+      } else {
+        const response = await fetch('/api/chat', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            messages: payloadMessages,
+            model: activeModel,
+            systemInstruction,
+            temperature: settings.temperature,
+          }),
+          signal: controller.signal,
+        });
+
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || 'Failed to generate response.');
+        }
+
+        setConversations((prev) =>
+          prev.map((c) => {
+            if (c.id !== conversationId) return c;
+            const msgs = [...c.messages];
+            const last = msgs[msgs.length - 1];
+            if (last && last.role === 'model') {
+              msgs[msgs.length - 1] = {
+                ...last,
+                content: data.text || '',
+                status: 'complete',
+              };
+            }
+            return { ...c, messages: msgs, updatedAt: Date.now() };
+          })
+        );
+      }
+    } catch (error: any) {
+      if (controller.signal.aborted) {
+        return;
+      }
+      console.error('Generation error:', error);
+      const errorMessage = error?.message || 'Failed to generate response.';
+
+      setConversations((prev) =>
+        prev.map((c) => {
+          if (c.id !== conversationId) return c;
+          const msgs = [...c.messages];
+          const last = msgs[msgs.length - 1];
+          if (last && last.role === 'model') {
+            msgs[msgs.length - 1] = {
+              ...last,
+              status: 'error',
+              error: errorMessage,
+            };
+          }
+          return { ...c, messages: msgs, updatedAt: Date.now() };
+        })
+      );
+    } finally {
+      isStreamingRef.current = false;
+      abortControllerRef.current = null;
+      setTimeout(() => scrollToBottom(), 50);
+    }
   };
 
   const handleSendMessage = async (content: string, attachments?: FileAttachment[]) => {
@@ -343,8 +456,9 @@ export default function App() {
     };
 
     const isFirstMessage = activeConversation.messages.length === 0;
+    const defaultTitle = attachments && attachments.length > 0 ? `File: ${attachments[0].name}` : 'New Conversation';
     const newTitle = isFirstMessage
-      ? content.slice(0, 36) + (content.length > 36 ? '...' : '')
+      ? (content.trim() ? content.slice(0, 36) + (content.length > 36 ? '...' : '') : defaultTitle)
       : activeConversation.title;
 
     const updatedMessages = [...activeConversation.messages, userMessage, modelPlaceholder];
